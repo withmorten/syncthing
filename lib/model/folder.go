@@ -697,6 +697,7 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 		EventLogger:           f.evLogger,
 		ScanOwnership:         f.SendOwnership || f.SyncOwnership,
 		ScanXattrs:            f.SendXattrs || f.SyncXattrs,
+		ScanWindowsAttributes: f.SyncWindowsAttributes,
 		XattrFilter:           f.XattrFilter,
 	}
 	var fchan chan scanner.ScanResult
@@ -935,12 +936,13 @@ func (f *folder) reconcileReceiveOnlyToGlobal(fi protocol.FileInfo, batch *scanB
 		return false, nil
 	}
 	if !gf.IsEquivalentOptional(fi, protocol.FileInfoComparison{
-		ModTimeWindow:   f.modTimeWindow,
-		IgnorePerms:     f.IgnorePerms,
-		IgnoreBlocks:    f.Type == config.FolderTypeReceiveEncrypted, // receive-encrypted cannot compare block hashes
-		IgnoreFlags:     protocol.FlagLocalReceiveOnly,
-		IgnoreOwnership: !f.SyncOwnership && !f.SendOwnership,
-		IgnoreXattrs:    !f.SyncXattrs && !f.SendXattrs,
+		ModTimeWindow:            f.modTimeWindow,
+		IgnorePerms:              f.IgnorePerms,
+		IgnoreBlocks:             f.Type == config.FolderTypeReceiveEncrypted, // receive-encrypted cannot compare block hashes
+		IgnoreFlags:              protocol.FlagLocalReceiveOnly,
+		IgnoreOwnership:          !f.SyncOwnership && !f.SendOwnership,
+		IgnoreXattrs:             !f.SyncXattrs && !f.SendXattrs,
+		CompareWindowsAttributes: f.SyncWindowsAttributes,
 	}) {
 		return false, nil
 	}
@@ -1122,7 +1124,8 @@ func (f *folder) monitorWatch(ctx context.Context) {
 	for {
 		select {
 		case <-failTimer.C:
-			eventChan, errChan, err = f.mtimefs.Watch(".", f.ignores, ctx, f.IgnorePerms)
+			// On Windows, attribute changes are only watched for along with permissions.
+			eventChan, errChan, err = f.mtimefs.Watch(".", f.ignores, ctx, f.IgnorePerms && !f.SyncWindowsAttributes)
 			// We do this once per minute initially increased to
 			// max one hour in case of repeat failures.
 			f.scanOnWatchErr()

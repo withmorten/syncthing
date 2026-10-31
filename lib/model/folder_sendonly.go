@@ -73,10 +73,11 @@ func (f *sendOnlyFolder) pull(ctx context.Context) (bool, error) {
 		}
 
 		if !file.IsEquivalentOptional(curFile, protocol.FileInfoComparison{
-			ModTimeWindow:   f.modTimeWindow,
-			IgnorePerms:     f.IgnorePerms,
-			IgnoreOwnership: !f.SyncOwnership,
-			IgnoreXattrs:    !f.SyncXattrs,
+			ModTimeWindow:            f.modTimeWindow,
+			IgnorePerms:              f.IgnorePerms,
+			IgnoreOwnership:          !f.SyncOwnership,
+			IgnoreXattrs:             !f.SyncXattrs,
+			CompareWindowsAttributes: f.SyncWindowsAttributes,
 		}) {
 			continue
 		}

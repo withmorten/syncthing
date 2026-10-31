@@ -65,6 +65,8 @@ type Config struct {
 	ScanOwnership bool
 	// If ScanXattrs is true, we pick up extended attributes on files while scanning.
 	ScanXattrs bool
+	// If ScanWindowsAttributes is true, we pick up the Hidden and System attributes on Windows.
+	ScanWindowsAttributes bool
 	// Filter for extended attributes
 	XattrFilter XattrFilter
 }
@@ -462,7 +464,7 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 		}
 	}
 
-	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.XattrFilter)
+	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.ScanWindowsAttributes, w.XattrFilter)
 	if err != nil {
 		return err
 	}
@@ -475,12 +477,13 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
-			ModTimeWindow:   w.ModTimeWindow,
-			IgnorePerms:     w.IgnorePerms,
-			IgnoreBlocks:    true,
-			IgnoreFlags:     w.LocalFlags,
-			IgnoreOwnership: !w.ScanOwnership,
-			IgnoreXattrs:    !w.ScanXattrs,
+			ModTimeWindow:            w.ModTimeWindow,
+			IgnorePerms:              w.IgnorePerms,
+			IgnoreBlocks:             true,
+			IgnoreFlags:              w.LocalFlags,
+			IgnoreOwnership:          !w.ScanOwnership,
+			IgnoreXattrs:             !w.ScanXattrs,
+			CompareWindowsAttributes: w.ScanWindowsAttributes,
 		}) {
 			l.Debugln(w, "unchanged:", curFile)
 			return nil
@@ -512,7 +515,7 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, finishedChan chan<- ScanResult) error {
 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
 
-	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.XattrFilter)
+	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.ScanWindowsAttributes, w.XattrFilter)
 	if err != nil {
 		return err
 	}
@@ -524,12 +527,13 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
-			ModTimeWindow:   w.ModTimeWindow,
-			IgnorePerms:     w.IgnorePerms,
-			IgnoreBlocks:    true,
-			IgnoreFlags:     w.LocalFlags,
-			IgnoreOwnership: !w.ScanOwnership,
-			IgnoreXattrs:    !w.ScanXattrs,
+			ModTimeWindow:            w.ModTimeWindow,
+			IgnorePerms:              w.IgnorePerms,
+			IgnoreBlocks:             true,
+			IgnoreFlags:              w.LocalFlags,
+			IgnoreOwnership:          !w.ScanOwnership,
+			IgnoreXattrs:             !w.ScanXattrs,
+			CompareWindowsAttributes: w.ScanWindowsAttributes,
 		}) {
 			l.Debugln(w, "unchanged:", curFile)
 			return nil
@@ -559,7 +563,7 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 }
 
 func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileInfo, finishedChan chan<- ScanResult) error {
-	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.XattrFilter)
+	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.ScanWindowsAttributes, w.XattrFilter)
 	if errors.Is(err, fs.ErrSymlinksNotSupported) {
 		// Symlinks the filesystem can't represent are ignored, not reported.
 		return nil
@@ -576,12 +580,13 @@ func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileIn
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
-			ModTimeWindow:   w.ModTimeWindow,
-			IgnorePerms:     w.IgnorePerms,
-			IgnoreBlocks:    true,
-			IgnoreFlags:     w.LocalFlags,
-			IgnoreOwnership: !w.ScanOwnership,
-			IgnoreXattrs:    !w.ScanXattrs,
+			ModTimeWindow:            w.ModTimeWindow,
+			IgnorePerms:              w.IgnorePerms,
+			IgnoreBlocks:             true,
+			IgnoreFlags:              w.LocalFlags,
+			IgnoreOwnership:          !w.ScanOwnership,
+			IgnoreXattrs:             !w.ScanXattrs,
+			CompareWindowsAttributes: w.ScanWindowsAttributes,
 		}) {
 			l.Debugln(w, "unchanged:", curFile, info.ModTime().Unix(), info.Mode()&fs.ModePerm)
 			return nil
@@ -747,7 +752,7 @@ func (noCurrentFiler) CurrentFile(_ string) (protocol.FileInfo, bool) {
 	return protocol.FileInfo{}, false
 }
 
-func CreateFileInfo(fi fs.FileInfo, name string, filesystem fs.Filesystem, scanOwnership bool, scanXattrs bool, xattrFilter XattrFilter) (protocol.FileInfo, error) {
+func CreateFileInfo(fi fs.FileInfo, name string, filesystem fs.Filesystem, scanOwnership, scanXattrs, scanWindowsAttributes bool, xattrFilter XattrFilter) (protocol.FileInfo, error) {
 	f := protocol.FileInfo{Name: name}
 	if scanOwnership || scanXattrs {
 		if plat, err := filesystem.PlatformData(name, scanOwnership, scanXattrs, xattrFilter); err == nil {
@@ -755,6 +760,12 @@ func CreateFileInfo(fi fs.FileInfo, name string, filesystem fs.Filesystem, scanO
 		} else {
 			return protocol.FileInfo{}, fmt.Errorf("reading platform data: %w", err)
 		}
+	}
+	if scanWindowsAttributes {
+		if f.Platform.Windows == nil {
+			f.Platform.Windows = &protocol.WindowsData{}
+		}
+		f.Platform.Windows.Attributes = fs.WindowsAttributes(fi)
 	}
 
 	if fi.IsSymlink() {

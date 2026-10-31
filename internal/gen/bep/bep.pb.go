@@ -1470,8 +1470,10 @@ type WindowsData struct {
 	// Windows file objects have a single owner, which may be a user or a
 	// group. We keep the name of that account, and a flag to indicate what
 	// type it is.
-	OwnerName     string `protobuf:"bytes,1,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
-	OwnerIsGroup  bool   `protobuf:"varint,2,opt,name=owner_is_group,json=ownerIsGroup,proto3" json:"owner_is_group,omitempty"`
+	OwnerName    string `protobuf:"bytes,1,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
+	OwnerIsGroup bool   `protobuf:"varint,2,opt,name=owner_is_group,json=ownerIsGroup,proto3" json:"owner_is_group,omitempty"`
+	// Hidden and System bits of the Windows file attributes.
+	Attributes    uint32 `protobuf:"varint,3,opt,name=attributes,proto3" json:"attributes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1518,6 +1520,13 @@ func (x *WindowsData) GetOwnerIsGroup() bool {
 		return x.OwnerIsGroup
 	}
 	return false
+}
+
+func (x *WindowsData) GetAttributes() uint32 {
+	if x != nil {
+		return x.Attributes
+	}
+	return 0
 }
 
 type XattrData struct {
@@ -2088,11 +2097,14 @@ const file_bep_bep_proto_rawDesc = "" +
 	"\n" +
 	"group_name\x18\x02 \x01(\tB\b\xbaH\x05r\x03\x18\x80\bR\tgroupName\x12\x10\n" +
 	"\x03uid\x18\x03 \x01(\x05R\x03uid\x12\x10\n" +
-	"\x03gid\x18\x04 \x01(\x05R\x03gid\"\\\n" +
+	"\x03gid\x18\x04 \x01(\x05R\x03gid\"|\n" +
 	"\vWindowsData\x12'\n" +
 	"\n" +
 	"owner_name\x18\x01 \x01(\tB\b\xbaH\x05r\x03\x18\x80\bR\townerName\x12$\n" +
-	"\x0eowner_is_group\x18\x02 \x01(\bR\fownerIsGroup\"/\n" +
+	"\x0eowner_is_group\x18\x02 \x01(\bR\fownerIsGroup\x12\x1e\n" +
+	"\n" +
+	"attributes\x18\x03 \x01(\rR\n" +
+	"attributes\"/\n" +
 	"\tXattrData\x12\"\n" +
 	"\x06xattrs\x18\x01 \x03(\v2\n" +
 	".bep.XattrR\x06xattrs\"1\n" +

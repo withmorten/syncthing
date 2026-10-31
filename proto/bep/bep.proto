@@ -203,6 +203,8 @@ message WindowsData {
   // type it is.
   string owner_name = 1 [(buf.validate.field).string.max_len = 1024];
   bool owner_is_group = 2;
+  // Hidden and System bits of the Windows file attributes.
+  uint32 attributes = 3;
 }
 
 message XattrData {

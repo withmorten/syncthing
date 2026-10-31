@@ -458,6 +458,8 @@ type FileInfoComparison struct {
 	IgnoreFlags     FlagLocal
 	IgnoreOwnership bool
 	IgnoreXattrs    bool
+	// Opt-in, so callers unaware of Windows attributes never see them as a difference.
+	CompareWindowsAttributes bool
 }
 
 func (f FileInfo) IsEquivalent(other FileInfo, modTimeWindow time.Duration) bool {
@@ -524,6 +526,9 @@ func (f FileInfo) isEquivalent(other FileInfo, comp FileInfoComparison) bool {
 		if !xattrsEqual(f.Platform.NetBSD, other.Platform.NetBSD) {
 			return false
 		}
+	}
+	if comp.CompareWindowsAttributes && f.Platform.Windows.GetAttributes() != other.Platform.Windows.GetAttributes() {
+		return false
 	}
 
 	if !comp.IgnorePerms && !f.NoPermissions && !other.NoPermissions && !PermsEqual(f.Permissions, other.Permissions) {

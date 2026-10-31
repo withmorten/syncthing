@@ -1075,14 +1075,15 @@ func (f *sendReceiveFolder) renameFile(cur, source, target protocol.FileInfo, db
 		err = errModified
 	default:
 		var fi protocol.FileInfo
-		if fi, err = scanner.CreateFileInfo(stat, target.Name, f.mtimefs, f.SyncOwnership, f.SyncXattrs, f.XattrFilter); err == nil {
+		if fi, err = scanner.CreateFileInfo(stat, target.Name, f.mtimefs, f.SyncOwnership, f.SyncXattrs, f.SyncWindowsAttributes, f.XattrFilter); err == nil {
 			if !fi.IsEquivalentOptional(curTarget, protocol.FileInfoComparison{
-				ModTimeWindow:   f.modTimeWindow,
-				IgnorePerms:     f.IgnorePerms,
-				IgnoreBlocks:    true,
-				IgnoreFlags:     protocol.LocalAllFlags,
-				IgnoreOwnership: !f.SyncOwnership,
-				IgnoreXattrs:    !f.SyncXattrs,
+				ModTimeWindow:            f.modTimeWindow,
+				IgnorePerms:              f.IgnorePerms,
+				IgnoreBlocks:             true,
+				IgnoreFlags:              protocol.LocalAllFlags,
+				IgnoreOwnership:          !f.SyncOwnership,
+				IgnoreXattrs:             !f.SyncXattrs,
+				CompareWindowsAttributes: f.SyncWindowsAttributes,
 			}) {
 				// Target changed
 				scanChan <- target.Name
@@ -2095,7 +2096,7 @@ func (f *sendReceiveFolder) deleteDirOnDiskHandleChildren(dir string, scanChan c
 			hasReceiveOnlyChanged = true
 			return nil
 		}
-		diskFile, err := scanner.CreateFileInfo(info, path, f.mtimefs, f.SyncOwnership, f.SyncXattrs, f.XattrFilter)
+		diskFile, err := scanner.CreateFileInfo(info, path, f.mtimefs, f.SyncOwnership, f.SyncXattrs, f.SyncWindowsAttributes, f.XattrFilter)
 		if err != nil {
 			// Lets just assume the file has changed.
 			scanChan <- path
@@ -2103,12 +2104,13 @@ func (f *sendReceiveFolder) deleteDirOnDiskHandleChildren(dir string, scanChan c
 			return nil //nolint:nilerr
 		}
 		if !cf.IsEquivalentOptional(diskFile, protocol.FileInfoComparison{
-			ModTimeWindow:   f.modTimeWindow,
-			IgnorePerms:     f.IgnorePerms,
-			IgnoreBlocks:    true,
-			IgnoreFlags:     protocol.LocalAllFlags,
-			IgnoreOwnership: !f.SyncOwnership,
-			IgnoreXattrs:    !f.SyncXattrs,
+			ModTimeWindow:            f.modTimeWindow,
+			IgnorePerms:              f.IgnorePerms,
+			IgnoreBlocks:             true,
+			IgnoreFlags:              protocol.LocalAllFlags,
+			IgnoreOwnership:          !f.SyncOwnership,
+			IgnoreXattrs:             !f.SyncXattrs,
+			CompareWindowsAttributes: f.SyncWindowsAttributes,
 		}) {
 			// File on disk changed compared to what we have in db
 			// -> schedule scan.
@@ -2173,17 +2175,18 @@ func (f *sendReceiveFolder) scanIfItemChanged(name string, stat fs.FileInfo, ite
 	// to the database. If there's a mismatch here, there might be local
 	// changes that we don't know about yet and we should scan before
 	// touching the item.
-	statItem, err := scanner.CreateFileInfo(stat, item.Name, f.mtimefs, f.SyncOwnership, f.SyncXattrs, f.XattrFilter)
+	statItem, err := scanner.CreateFileInfo(stat, item.Name, f.mtimefs, f.SyncOwnership, f.SyncXattrs, f.SyncWindowsAttributes, f.XattrFilter)
 	if err != nil {
 		return fmt.Errorf("comparing item on disk to db: %w", err)
 	}
 	if !statItem.IsEquivalentOptional(item, protocol.FileInfoComparison{
-		ModTimeWindow:   f.modTimeWindow,
-		IgnorePerms:     f.IgnorePerms,
-		IgnoreBlocks:    true,
-		IgnoreFlags:     protocol.LocalAllFlags,
-		IgnoreOwnership: fromDelete || !f.SyncOwnership,
-		IgnoreXattrs:    fromDelete || !f.SyncXattrs,
+		ModTimeWindow:            f.modTimeWindow,
+		IgnorePerms:              f.IgnorePerms,
+		IgnoreBlocks:             true,
+		IgnoreFlags:              protocol.LocalAllFlags,
+		IgnoreOwnership:          fromDelete || !f.SyncOwnership,
+		IgnoreXattrs:             fromDelete || !f.SyncXattrs,
+		CompareWindowsAttributes: !fromDelete && f.SyncWindowsAttributes,
 	}) {
 		return errModified
 	}
@@ -2238,6 +2241,14 @@ func (f *sendReceiveFolder) setPlatformData(file *protocol.FileInfo, name string
 	} else if f.CopyOwnershipFromParent {
 		// Copy the parent owner and group.
 		if err := f.copyOwnershipFromParent(name); err != nil {
+			return err
+		}
+	}
+
+	// Without Windows data the sender doesn't track attributes, so leave ours alone.
+	if f.SyncWindowsAttributes && file.Platform.Windows != nil {
+		f.sl.Debug("Setting Windows attributes", slogutil.FilePath(name), slog.String("attributes", fmt.Sprintf("0x%x", file.Platform.Windows.Attributes)))
+		if err := fs.SetWindowsAttributes(f.mtimefs, name, file.Platform.Windows.Attributes); err != nil {
 			return err
 		}
 	}
