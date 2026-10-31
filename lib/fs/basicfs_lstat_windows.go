@@ -73,6 +73,19 @@ func (fi *dirJunctFileInfo) IsDir() bool {
 	return true
 }
 
+// Reports a junction as a symlink regardless of the Go version's winsymlink default.
+type junctionSymlinkFileInfo struct {
+	os.FileInfo
+}
+
+func (fi *junctionSymlinkFileInfo) Mode() os.FileMode {
+	return fi.FileInfo.Mode()&^(junctionPointModeMask|os.ModeDir) | os.ModeSymlink
+}
+
+func (fi *junctionSymlinkFileInfo) IsDir() bool {
+	return false
+}
+
 var junctionPointModeMask os.FileMode
 
 func init() {
@@ -92,13 +105,14 @@ func (f *BasicFilesystem) underlyingLstat(name string) (os.FileInfo, error) {
 
 	// There are cases where files are tagged as symlink, but they end up being
 	// something else. Make sure we properly handle those types.
-	if err == nil {
-		// NTFS directory junctions can be treated as ordinary directories,
-		// see https://forum.syncthing.net/t/option-to-follow-directory-junctions-symbolic-links/14750
-		if fi.Mode()&junctionPointModeMask != 0 && f.junctionsAsDirs {
-			if reparseTag, reparseErr := readReparseTag(name); reparseErr == nil && isDirectoryJunction(reparseTag) {
+	if err == nil && fi.Mode()&junctionPointModeMask != 0 {
+		if reparseTag, reparseErr := readReparseTag(name); reparseErr == nil && isDirectoryJunction(reparseTag) {
+			// NTFS directory junctions can be treated as ordinary directories,
+			// see https://forum.syncthing.net/t/option-to-follow-directory-junctions-symbolic-links/14750
+			if f.junctionsAsDirs {
 				return &dirJunctFileInfo{fi}, nil
 			}
+			return &junctionSymlinkFileInfo{fi}, nil
 		}
 	}
 

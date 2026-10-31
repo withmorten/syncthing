@@ -559,13 +559,11 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 }
 
 func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileInfo, finishedChan chan<- ScanResult) error {
-	// Symlinks are not supported on Windows. We ignore instead of returning
-	// an error.
-	if build.IsWindows {
+	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.XattrFilter)
+	if errors.Is(err, fs.ErrSymlinksNotSupported) {
+		// Symlinks the filesystem can't represent are ignored, not reported.
 		return nil
 	}
-
-	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.XattrFilter)
 	if err != nil {
 		return err
 	}

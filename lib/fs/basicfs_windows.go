@@ -15,20 +15,258 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf16"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 const optNoFollow = 0 // not defined for Windows
 
-var errNotSupported = errors.New("symlinks not supported")
+var (
+	errNotJunction         = errors.New("not a junction")
+	errJunctionTarget      = errors.New("junction target must be absolute path")
+	errJunctionTargetEmpty = errors.New("junction target is empty")
+)
 
-func (BasicFilesystem) ReadSymlink(path string) (string, error) {
-	return "", errNotSupported
+const (
+	_FSCTL_GET_REPARSE_POINT = 0x900A8
+	_FSCTL_SET_REPARSE_POINT = 0x900A4
+)
+
+// readJunctionTarget reads the target of a junction using FSCTL_GET_REPARSE_POINT.
+// Returns the clean target path (e.g., "C:\path") without the NT prefix.
+func readJunctionTarget(path string) (string, error) {
+	namep, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Open the junction with reparse point flag
+	h, err := syscall.CreateFile(
+		namep,
+		syscall.GENERIC_READ,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
+		nil,
+		syscall.OPEN_EXISTING,
+		syscall.FILE_FLAG_BACKUP_SEMANTICS|syscall.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer syscall.CloseHandle(h)
+
+	// Buffer for REPARSE_DATA_BUFFER - max reparse data is 16KB
+	buf := make([]byte, 16*1024)
+	var bytesReturned uint32
+
+	err = syscall.DeviceIoControl(
+		h,
+		_FSCTL_GET_REPARSE_POINT,
+		nil,
+		0,
+		&buf[0],
+		uint32(len(buf)),
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	// Parse REPARSE_DATA_BUFFER
+	// struct layout:
+	//   ULONG  ReparseTag;           // offset 0
+	//   USHORT ReparseDataLength;    // offset 4
+	//   USHORT Reserved;             // offset 6
+	//   USHORT SubstituteNameOffset; // offset 8
+	//   USHORT SubstituteNameLength; // offset 10
+	//   USHORT PrintNameOffset;      // offset 12
+	//   USHORT PrintNameLength;      // offset 14
+	//   WCHAR  PathBuffer[1];        // offset 16
+
+	reparseTag := *(*uint32)(unsafe.Pointer(&buf[0]))
+	if reparseTag != windows.IO_REPARSE_TAG_MOUNT_POINT {
+		return "", errNotJunction
+	}
+
+	substNameOffset := *(*uint16)(unsafe.Pointer(&buf[8]))
+	substNameLength := *(*uint16)(unsafe.Pointer(&buf[10]))
+
+	// PathBuffer starts at offset 16
+	pathBufStart := 16
+	substStart := pathBufStart + int(substNameOffset)
+	substEnd := substStart + int(substNameLength)
+
+	if substEnd > int(bytesReturned) {
+		return "", errors.New("invalid reparse data")
+	}
+
+	// Convert UTF-16 bytes to string
+	substBytes := buf[substStart:substEnd]
+	u16 := make([]uint16, len(substBytes)/2)
+	for i := range u16 {
+		u16[i] = uint16(substBytes[i*2]) | uint16(substBytes[i*2+1])<<8
+	}
+	target := string(utf16.Decode(u16))
+
+	target = strings.TrimPrefix(target, `\??\`)
+
+	if target == "" {
+		return "", errJunctionTargetEmpty
+	}
+
+	return target, nil
 }
 
-func (BasicFilesystem) CreateSymlink(target, name string) error {
-	return errNotSupported
+// createJunction creates a junction at name pointing to target.
+// target must be an absolute path.
+func createJunction(target, name string) error {
+	if target == "" {
+		return errJunctionTargetEmpty
+	}
+	if !filepath.IsAbs(target) {
+		return errJunctionTarget
+	}
+
+	// Create the directory for the junction
+	if err := os.Mkdir(name, 0o755); err != nil {
+		return err
+	}
+
+	namep, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		os.Remove(name)
+		return err
+	}
+
+	// Open the directory with write access
+	h, err := syscall.CreateFile(
+		namep,
+		syscall.GENERIC_WRITE,
+		0,
+		nil,
+		syscall.OPEN_EXISTING,
+		syscall.FILE_FLAG_BACKUP_SEMANTICS|syscall.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		os.Remove(name)
+		return err
+	}
+	defer syscall.CloseHandle(h)
+
+	// Convert target to NT path format: \??\C:\path
+	ntTarget := `\??\` + target
+
+	// Convert to UTF-16
+	targetU16 := utf16.Encode([]rune(ntTarget))
+
+	// Build REPARSE_DATA_BUFFER for mount point
+	// SubstituteName = ntTarget (with null terminator)
+	// PrintName = target (without NT prefix, with null terminator)
+	printU16 := utf16.Encode([]rune(target))
+
+	substNameLen := len(targetU16) * 2
+	printNameLen := len(printU16) * 2
+	pathBufLen := substNameLen + 2 + printNameLen + 2 // +2 for null terminators
+
+	// Total buffer size: 8 (header) + 8 (mount point fields) + pathBufLen
+	bufSize := 8 + 8 + pathBufLen
+	buf := make([]byte, bufSize)
+
+	// ReparseTag
+	*(*uint32)(unsafe.Pointer(&buf[0])) = windows.IO_REPARSE_TAG_MOUNT_POINT
+	// ReparseDataLength = 8 (mount point fields) + pathBufLen
+	*(*uint16)(unsafe.Pointer(&buf[4])) = uint16(8 + pathBufLen)
+	// Reserved = 0
+	*(*uint16)(unsafe.Pointer(&buf[6])) = 0
+	// SubstituteNameOffset = 0
+	*(*uint16)(unsafe.Pointer(&buf[8])) = 0
+	// SubstituteNameLength (without null terminator)
+	*(*uint16)(unsafe.Pointer(&buf[10])) = uint16(substNameLen)
+	// PrintNameOffset = substNameLen + 2 (after substitute name + null)
+	*(*uint16)(unsafe.Pointer(&buf[12])) = uint16(substNameLen + 2)
+	// PrintNameLength (without null terminator)
+	*(*uint16)(unsafe.Pointer(&buf[14])) = uint16(printNameLen)
+
+	// PathBuffer starts at offset 16
+	pathBuf := buf[16:]
+
+	// Write SubstituteName
+	for i, c := range targetU16 {
+		pathBuf[i*2] = byte(c)
+		pathBuf[i*2+1] = byte(c >> 8)
+	}
+	// Null terminator for SubstituteName
+	pathBuf[substNameLen] = 0
+	pathBuf[substNameLen+1] = 0
+
+	// Write PrintName
+	printStart := substNameLen + 2
+	for i, c := range printU16 {
+		pathBuf[printStart+i*2] = byte(c)
+		pathBuf[printStart+i*2+1] = byte(c >> 8)
+	}
+	// Null terminator for PrintName
+	pathBuf[printStart+printNameLen] = 0
+	pathBuf[printStart+printNameLen+1] = 0
+
+	var bytesReturned uint32
+	err = syscall.DeviceIoControl(
+		h,
+		_FSCTL_SET_REPARSE_POINT,
+		&buf[0],
+		uint32(len(buf)),
+		nil,
+		0,
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		syscall.CloseHandle(h)
+		os.Remove(name)
+		return err
+	}
+
+	return nil
+}
+
+func (f *BasicFilesystem) ReadSymlink(path string) (string, error) {
+	if f.junctionsAsDirs {
+		return "", ErrSymlinksNotSupported
+	}
+
+	absPath, err := f.rooted(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Check if this is a junction
+	reparseTag, err := readReparseTag(absPath)
+	if err != nil {
+		return "", err
+	}
+	if !isDirectoryJunction(reparseTag) {
+		return "", ErrSymlinksNotSupported
+	}
+
+	return readJunctionTarget(absPath)
+}
+
+func (f *BasicFilesystem) CreateSymlink(target, name string) error {
+	if f.junctionsAsDirs {
+		return ErrSymlinksNotSupported
+	}
+
+	absName, err := f.rooted(name)
+	if err != nil {
+		return err
+	}
+
+	// Create a junction (target must be absolute path)
+	return createJunction(target, absName)
 }
 
 func (f *BasicFilesystem) Unhide(name string) error {

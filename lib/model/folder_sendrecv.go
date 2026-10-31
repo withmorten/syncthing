@@ -399,7 +399,7 @@ loop:
 				f.queue.Push(file.Name, file.Size, file.ModTime())
 			}
 
-		case (build.IsWindows || build.IsAndroid) && file.IsSymlink():
+		case file.IsSymlink() && !f.canCreateSymlink(file):
 			if err := f.handleSymlinkCheckExisting(file, scanChan); err != nil {
 				f.newPullError(file.Name, fmt.Errorf("handling unsupported symlink: %w", err))
 				break
@@ -804,6 +804,18 @@ func (f *sendReceiveFolder) handleSymlink(file protocol.FileInfo, dbUpdateChan c
 		dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleSymlink}
 	} else {
 		f.newPullError(file.Name, fmt.Errorf("symlink create: %w", err))
+	}
+}
+
+// On Windows symlinks are created as junctions, which need an absolute target.
+func (f *sendReceiveFolder) canCreateSymlink(file protocol.FileInfo) bool {
+	switch {
+	case build.IsAndroid:
+		return false
+	case build.IsWindows:
+		return !f.JunctionsAsDirs && filepath.IsAbs(string(file.SymlinkTarget))
+	default:
+		return true
 	}
 }
 
