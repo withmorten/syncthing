@@ -70,6 +70,10 @@ type folder struct {
 	pullPause     time.Duration
 	pullFailTimer *time.Timer
 
+	// Set until the puller has created the recorded hard links that are
+	// missing on disk, once after the folder starts.
+	linkMissingHardlinks bool
+
 	scanErrors []FileError
 	pullErrors []FileError
 	errorsMut  sync.Mutex
@@ -427,7 +431,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if needCount.TotalItems() == 0 {
+	if needCount.TotalItems() == 0 && !f.linkMissingHardlinks {
 		// Clears pull failures on items that were needed before, but aren't anymore.
 		f.errorsMut.Lock()
 		f.pullErrors = nil
@@ -698,6 +702,7 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 		ScanOwnership:         f.SendOwnership || f.SyncOwnership,
 		ScanXattrs:            f.SendXattrs || f.SyncXattrs,
 		ScanWindowsAttributes: f.SyncWindowsAttributes,
+		ScanHardlinks:         f.SyncHardlinks,
 		XattrFilter:           f.XattrFilter,
 	}
 	var fchan chan scanner.ScanResult

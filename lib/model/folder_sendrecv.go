@@ -142,6 +142,7 @@ func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.Fold
 		writeLimiter:       semaphore.New(cfg.MaxConcurrentWrites),
 	}
 	f.puller = f
+	f.linkMissingHardlinks = f.hardlinksEnabled()
 
 	if f.Copiers == 0 {
 		// "Copiers" is effectively the concurrency level for a number of
@@ -287,6 +288,9 @@ func (f *sendReceiveFolder) pullerIteration(ctx context.Context, scanChan chan<-
 	}
 
 	fileDeletions, dirDeletions, err := f.processNeeded(ctx, dbUpdateChan, copyChan, scanChan)
+	if err == nil && f.linkMissingHardlinks {
+		err = f.linkHardlinks(ctx, dbUpdateChan, scanChan)
+	}
 
 	// Signal copy and puller routines that we are done with the in data for
 	// this iteration. Wait for them to finish.
@@ -389,7 +393,7 @@ loop:
 			if err != nil {
 				return nil, nil, err
 			}
-			if hasCurFile && curFile.Type == file.Type && file.BlocksEqual(curFile) {
+			if hasCurFile && curFile.Type == file.Type && file.BlocksEqual(curFile) && f.hardlinkSatisfied(file) {
 				// We are supposed to copy the entire file, and then fetch nothing. We
 				// are only updating metadata, so we don't actually *need* to make the
 				// copy.
@@ -466,6 +470,20 @@ nextFile:
 		if !f.checkParent(fi.Name, scanChan) {
 			f.queue.Done(fileName)
 			continue
+		}
+
+		if target := f.hardlinkTarget(fi); target != "" {
+			switch {
+			case f.hardlinkReady(fi, target, scanChan):
+				f.queue.Done(fileName)
+				f.handleHardlink(fi, target, dbUpdateChan, scanChan)
+				continue
+			case f.hardlinkPending(fi, target):
+				// The next puller iteration links it, once the target is synced.
+				f.queue.Done(fileName)
+				f.newPullError(fileName, fmt.Errorf("waiting for hardlink target %s to be synced", target))
+				continue
+			}
 		}
 
 		// Check our list of files to be removed for a match, in which case
@@ -817,6 +835,137 @@ func (f *sendReceiveFolder) canCreateSymlink(file protocol.FileInfo) bool {
 	default:
 		return true
 	}
+}
+
+// hardlinksEnabled reports whether hard links are synced in this folder.
+func (f *sendReceiveFolder) hardlinksEnabled() bool {
+	return f.SyncHardlinks && f.Type != config.FolderTypeReceiveEncrypted
+}
+
+// hardlinkTarget returns the file that file should be a hard link of, if any.
+func (f *sendReceiveFolder) hardlinkTarget(file protocol.FileInfo) string {
+	if !f.hardlinksEnabled() {
+		return ""
+	}
+	return file.Platform.Windows.GetHardlinkTarget()
+}
+
+// hardlinkSatisfied reports whether file needs no hard link created on disk.
+func (f *sendReceiveFolder) hardlinkSatisfied(file protocol.FileInfo) bool {
+	target := f.hardlinkTarget(file)
+	if target == "" {
+		return true
+	}
+	names, err := fs.HardlinkNames(f.mtimefs, file.Name)
+	return err == nil && slices.ContainsFunc(names, func(name string) bool { return strings.EqualFold(name, target) })
+}
+
+// hardlinkReady reports whether target is on disk, unchanged, with the same content as file.
+func (f *sendReceiveFolder) hardlinkReady(file protocol.FileInfo, target string, scanChan chan<- string) bool {
+	cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, target)
+	if err != nil || !ok || cur.IsDeleted() || cur.IsInvalid() || cur.Type != protocol.FileInfoTypeFile || !cur.BlocksEqual(file) {
+		return false
+	}
+	stat, err := f.mtimefs.Lstat(target)
+	if err != nil {
+		return false
+	}
+	return f.scanIfItemChanged(target, stat, cur, true, false, scanChan) == nil
+}
+
+// hardlinkPending reports whether target is about to be synced with the same content as file.
+func (f *sendReceiveFolder) hardlinkPending(file protocol.FileInfo, target string) bool {
+	if f.ignores.Match(target).IsIgnored() {
+		return false
+	}
+	global, ok, err := f.model.sdb.GetGlobalFile(f.folderID, target)
+	return err == nil && ok && !global.IsDeleted() && !global.IsInvalid() && global.Type == protocol.FileInfoTypeFile && global.BlocksEqual(file)
+}
+
+// linkHardlinks creates the hard links that are recorded for files we are
+// in sync with, but missing on disk, e.g. because hard link syncing was
+// enabled only after the files were synced.
+func (f *sendReceiveFolder) linkHardlinks(ctx context.Context, dbUpdateChan chan<- dbUpdateJob, scanChan chan<- string) error {
+	f.linkMissingHardlinks = false
+
+	var missing []protocol.FileInfo
+	for file, err := range itererr.Zip(f.model.sdb.AllLocalFiles(f.folderID, protocol.LocalDeviceID)) {
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if f.hardlinkTarget(file) == "" || file.IsDeleted() || file.IsInvalid() || file.Type != protocol.FileInfoTypeFile || f.hardlinkSatisfied(file) {
+			continue
+		}
+		missing = append(missing, file)
+	}
+
+	for _, file := range missing {
+		// Files we don't have the global version of yet are linked when
+		// they are pulled.
+		global, ok, err := f.model.sdb.GetGlobalFile(f.folderID, file.Name)
+		if err != nil {
+			return err
+		}
+		if !ok || !global.Version.Equal(file.Version) {
+			continue
+		}
+		target := f.hardlinkTarget(file)
+		if f.hardlinkReady(file, target, scanChan) {
+			f.sl.DebugContext(ctx, "Creating missing hardlink", slogutil.FilePath(file.Name), slog.String("target", target))
+			f.handleHardlink(file, target, dbUpdateChan, scanChan)
+		}
+	}
+	return nil
+}
+
+// handleHardlink replaces file on disk with a hard link to target.
+func (f *sendReceiveFolder) handleHardlink(file protocol.FileInfo, target string, dbUpdateChan chan<- dbUpdateJob, scanChan chan<- string) {
+	// Used in the defer closure below, updated by the function body. Take
+	// care not declare another err.
+	var err error
+
+	f.evLogger.Log(events.ItemStarted, map[string]string{
+		"folder": f.folderID,
+		"item":   file.Name,
+		"type":   "file",
+		"action": "update",
+	})
+
+	defer func() {
+		if err != nil {
+			f.newPullError(file.Name, fmt.Errorf("creating hardlink to %s: %w", target, err))
+		} else {
+			slog.Info("Created hardlink", f.LogAttr(), file.LogAttr(), slog.String("target", target))
+		}
+		f.evLogger.Log(events.ItemFinished, map[string]interface{}{
+			"folder": f.folderID,
+			"item":   file.Name,
+			"error":  events.Error(err),
+			"type":   "file",
+			"action": "update",
+		})
+	}()
+
+	curFile, hasCurFile, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
+	if err != nil {
+		return
+	}
+
+	// Create the link under the temporary name, then let performFinish move
+	// it into place like a downloaded file.
+	tempName := fs.TempName(file.Name)
+	_ = f.inWritableDir(f.mtimefs.Remove, tempName)
+	if err = f.inWritableDir(func(name string) error {
+		return fs.CreateHardlink(f.mtimefs, target, name)
+	}, tempName); err != nil {
+		return
+	}
+	err = f.performFinish(file, curFile, hasCurFile, tempName, dbUpdateChan, scanChan)
 }
 
 func (f *sendReceiveFolder) handleSymlinkCheckExisting(file protocol.FileInfo, scanChan chan<- string) error {
@@ -1745,6 +1894,10 @@ func (f *sendReceiveFolder) performFinish(file, curFile protocol.FileInfo, hasCu
 			err = f.inWritableDir(func(name string) error {
 				return f.moveForConflict(name, file.ModifiedBy.String(), scanChan)
 			}, curFile.Name)
+		} else if hasCurFile && !curFile.IsDeleted() && !curFile.IsInvalid() && curFile.Type == protocol.FileInfoTypeFile && curFile.BlocksEqual(file) {
+			// The content stays the same, as when the file is replaced by
+			// a hard link, so there is nothing to archive.
+			err = f.inWritableDir(f.mtimefs.Remove, curFile.Name)
 		} else {
 			err = f.deleteItemOnDisk(curFile, scanChan)
 		}

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -67,6 +68,8 @@ type Config struct {
 	ScanXattrs bool
 	// If ScanWindowsAttributes is true, we pick up the Hidden and System attributes on Windows.
 	ScanWindowsAttributes bool
+	// If ScanHardlinks is true, we record which other file a hard link should link to on Windows.
+	ScanHardlinks bool
 	// Filter for extended attributes
 	XattrFilter XattrFilter
 }
@@ -97,7 +100,7 @@ func WalkWithoutHashing(ctx context.Context, cfg Config) chan ScanResult {
 }
 
 func newWalker(cfg Config) *walker {
-	w := &walker{cfg}
+	w := &walker{Config: cfg}
 
 	if w.CurrentFiler == nil {
 		w.CurrentFiler = noCurrentFiler{}
@@ -121,6 +124,9 @@ var (
 
 type walker struct {
 	Config
+
+	// Hard-linked files already walked in this scan, see walkHardlinkSiblings.
+	hardlinksWalked map[string]struct{}
 }
 
 // Walk returns the list of files found in the local folder by scanning the
@@ -436,7 +442,19 @@ func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo, 
 		return w.walkDir(ctx, path, info, finishedChan)
 
 	case info.IsRegular():
-		return w.walkRegular(ctx, path, info, toHashChan)
+		if !w.ScanHardlinks {
+			return w.walkRegular(ctx, path, info, nil, toHashChan)
+		}
+		if _, ok := w.hardlinksWalked[path]; ok {
+			// Already walked as another name of a hard-linked file.
+			return nil
+		}
+		linkNames := w.hardlinkNames(path)
+		if err := w.walkRegular(ctx, path, info, linkNames, toHashChan); err != nil {
+			return err
+		}
+		w.walkHardlinkSiblings(ctx, path, linkNames, toHashChan, finishedChan)
+		return nil
 
 	default:
 		// A special file, socket, fifo, etc. -- do nothing, just skip and continue scanning.
@@ -445,7 +463,9 @@ func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo, 
 	}
 }
 
-func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo) error {
+// linkNames are the other names of the file if it's hard-linked, as returned
+// by hardlinkNames.
+func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, linkNames []string, toHashChan chan<- protocol.FileInfo) error {
 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
 
 	blockSize := protocol.BlockSize(info.Size())
@@ -468,6 +488,12 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 	if err != nil {
 		return err
 	}
+	if w.ScanHardlinks {
+		if f.Platform.Windows == nil {
+			f.Platform.Windows = &protocol.WindowsData{}
+		}
+		f.Platform.Windows.HardlinkTarget = hardlinkPrimary(relPath, linkNames)
+	}
 	f = w.updateFileInfo(f, curFile)
 	f.NoPermissions = w.IgnorePerms
 	f.RawBlockSize = int32(blockSize)
@@ -484,7 +510,7 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 			IgnoreOwnership:          !w.ScanOwnership,
 			IgnoreXattrs:             !w.ScanXattrs,
 			CompareWindowsAttributes: w.ScanWindowsAttributes,
-		}) {
+		}) && !w.hardlinkChanged(f, curFile) {
 			l.Debugln(w, "unchanged:", curFile)
 			return nil
 		}
@@ -613,6 +639,94 @@ func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileIn
 	}
 
 	return nil
+}
+
+// hardlinkNames returns the other names of a hard-linked file that are synced.
+func (w *walker) hardlinkNames(relPath string) []string {
+	names, err := fs.HardlinkNames(w.Filesystem, relPath)
+	if err != nil {
+		l.Debugf("%v: reading hard links of %s: %v", w, relPath, err)
+		return nil
+	}
+	if len(names) > 0 {
+		l.Debugf("%v: hard links of %s: %q", w, relPath, names)
+	}
+	synced := names[:0]
+	for _, name := range names {
+		name = normalizePath(name)
+		if fs.IsTemporary(name) || fs.IsInternal(name) || w.Matcher.Match(name).IsIgnored() {
+			continue
+		}
+		synced = append(synced, name)
+	}
+	return synced
+}
+
+// hardlinkPrimary returns the name all links of a file point to: the first
+// one in sort order, which every device derives the same way. It returns ""
+// if relPath is itself that name.
+func hardlinkPrimary(relPath string, linkNames []string) string {
+	primary := relPath
+	for _, name := range linkNames {
+		if name < primary {
+			primary = name
+		}
+	}
+	if primary == relPath {
+		return ""
+	}
+	return primary
+}
+
+// hardlinkChanged reports whether f should now link to a different name
+// than recorded in cur.
+func (w *walker) hardlinkChanged(f, cur protocol.FileInfo) bool {
+	return w.ScanHardlinks && hardlinkStale(f.Platform.Windows.GetHardlinkTarget(), cur.Platform.Windows.GetHardlinkTarget())
+}
+
+// hardlinkStale reports whether a recorded link target needs to be replaced
+// by the current one. A link that is merely missing on disk doesn't count,
+// so a device that couldn't create a link doesn't send that back as a
+// change.
+func hardlinkStale(current, recorded string) bool {
+	return current != "" && !strings.EqualFold(current, recorded)
+}
+
+// walkHardlinkSiblings walks the other names of a hard-linked file whose
+// recorded link target is out of date. A new link may change the name that
+// all of them link to, but a scan triggered by the watcher only covers the
+// name that was created.
+func (w *walker) walkHardlinkSiblings(ctx context.Context, relPath string, linkNames []string, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) {
+	if len(linkNames) == 0 {
+		return
+	}
+	if w.hardlinksWalked == nil {
+		w.hardlinksWalked = make(map[string]struct{})
+	}
+	w.hardlinksWalked[relPath] = struct{}{}
+
+	group := append([]string{relPath}, linkNames...)
+	for _, name := range linkNames {
+		if _, ok := w.hardlinksWalked[name]; ok {
+			continue
+		}
+		others := slices.DeleteFunc(slices.Clone(group), func(other string) bool { return other == name })
+		cur, ok := w.CurrentFiler.CurrentFile(name)
+		if ok && !cur.IsDeleted() && !hardlinkStale(hardlinkPrimary(name, others), cur.Platform.Windows.GetHardlinkTarget()) {
+			continue
+		}
+		l.Debugf("%v: walking %s, a hard link of %s", w, name, relPath)
+		info, err := w.Filesystem.Lstat(name)
+		if err != nil {
+			if !fs.IsNotExist(err) {
+				handleError(ctx, "scan", name, err, finishedChan)
+			}
+			continue
+		}
+		if err := w.handleItem(ctx, name, info, toHashChan, finishedChan); err != nil {
+			handleError(ctx, "scan", name, err, finishedChan)
+		}
+	}
 }
 
 func normalizePath(path string) string {

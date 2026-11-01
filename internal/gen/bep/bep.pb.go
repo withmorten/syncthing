@@ -1473,9 +1473,11 @@ type WindowsData struct {
 	OwnerName    string `protobuf:"bytes,1,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
 	OwnerIsGroup bool   `protobuf:"varint,2,opt,name=owner_is_group,json=ownerIsGroup,proto3" json:"owner_is_group,omitempty"`
 	// Hidden and System bits of the Windows file attributes.
-	Attributes    uint32 `protobuf:"varint,3,opt,name=attributes,proto3" json:"attributes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Attributes uint32 `protobuf:"varint,3,opt,name=attributes,proto3" json:"attributes,omitempty"`
+	// Folder-relative name of another hard link to the same file, if any.
+	HardlinkTarget string `protobuf:"bytes,4,opt,name=hardlink_target,json=hardlinkTarget,proto3" json:"hardlink_target,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *WindowsData) Reset() {
@@ -1527,6 +1529,13 @@ func (x *WindowsData) GetAttributes() uint32 {
 		return x.Attributes
 	}
 	return 0
+}
+
+func (x *WindowsData) GetHardlinkTarget() string {
+	if x != nil {
+		return x.HardlinkTarget
+	}
+	return ""
 }
 
 type XattrData struct {
@@ -2097,14 +2106,15 @@ const file_bep_bep_proto_rawDesc = "" +
 	"\n" +
 	"group_name\x18\x02 \x01(\tB\b\xbaH\x05r\x03\x18\x80\bR\tgroupName\x12\x10\n" +
 	"\x03uid\x18\x03 \x01(\x05R\x03uid\x12\x10\n" +
-	"\x03gid\x18\x04 \x01(\x05R\x03gid\"|\n" +
+	"\x03gid\x18\x04 \x01(\x05R\x03gid\"\xa5\x01\n" +
 	"\vWindowsData\x12'\n" +
 	"\n" +
 	"owner_name\x18\x01 \x01(\tB\b\xbaH\x05r\x03\x18\x80\bR\townerName\x12$\n" +
 	"\x0eowner_is_group\x18\x02 \x01(\bR\fownerIsGroup\x12\x1e\n" +
 	"\n" +
 	"attributes\x18\x03 \x01(\rR\n" +
-	"attributes\"/\n" +
+	"attributes\x12'\n" +
+	"\x0fhardlink_target\x18\x04 \x01(\tR\x0ehardlinkTarget\"/\n" +
 	"\tXattrData\x12\"\n" +
 	"\x06xattrs\x18\x01 \x03(\v2\n" +
 	".bep.XattrR\x06xattrs\"1\n" +

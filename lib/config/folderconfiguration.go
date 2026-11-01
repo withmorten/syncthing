@@ -87,6 +87,7 @@ type FolderConfiguration struct {
 	SyncXattrs              bool                        `json:"syncXattrs" xml:"syncXattrs"`
 	SendXattrs              bool                        `json:"sendXattrs" xml:"sendXattrs"`
 	SyncWindowsAttributes   bool                        `json:"syncWindowsAttributes" xml:"syncWindowsAttributes"`
+	SyncHardlinks           bool                        `json:"syncHardlinks" xml:"syncHardlinks"`
 	BlockIndexing           bool                        `json:"blockIndexing" xml:"blockIndexing" default:"true"`
 	XattrFilter             XattrFilter                 `json:"xattrFilter" xml:"xattrFilter"`
 	// Legacy deprecated

@@ -205,6 +205,8 @@ message WindowsData {
   bool owner_is_group = 2;
   // Hidden and System bits of the Windows file attributes.
   uint32 attributes = 3;
+  // Folder-relative name of another hard link to the same file, if any.
+  string hardlink_target = 4;
 }
 
 message XattrData {
